@@ -1,10 +1,9 @@
 import requests
 
 
-# Nicehash name on left, mtc on right
+# Nicehash name on left, wtm on right
 remap_algorithms = {
     'daggerhashimoto': 'ethash',
-    'sha256asicboost': 'sha256'
 }
 
 
@@ -16,17 +15,27 @@ class NiceHash:
     def __init__(self):
         self._session = requests.Session()
         # self._session.headers.update({'Cookie': os.env['NICEHASH_COOKIE']})
-        self._buy_info = requests.get('https://api.nicehash.com/api?method=buy.info').json()
-        self._global_stats = requests.get('https://api.nicehash.com/api?method=stats.global.current').json()
+        _buy_info = requests.get('https://api2.nicehash.com/main/api/v2/public/buy/info').json()['miningAlgorithms']
+        _global_stats = requests.get('https://api2.nicehash.com/main/api/v2/public/stats/global/current').json()['algos']
+        self._algorithms = {a['order']: a for a in requests.get('https://api2.nicehash.com/main/api/v2/mining/algorithms/').json()['miningAlgorithms']}
+        """Set up global stats"""
+        self._global_stats = {}
+        for stats in _global_stats:
+            self._global_stats[stats['a']] = stats
+        """Set up buy info"""
+        self._buy_info = {}
+        for info in _buy_info:
+            self._buy_info[info['algo']] = info
+        """Set up algo ids"""
         self._algo_ids = self._get_algo_ids()
 
     def _get_algo_ids(self):
-        algorithms = requests.get('https://api.nicehash.com/api?method=multialgo.info').json()['result']['multialgo']
+        algorithms = requests.get('https://api2.nicehash.com/main/api/v2/mining/algorithms/').json()['miningAlgorithms']
         algo_ids = {}
         for a in algorithms:
-            name = a['name'].lower()
+            name = a['algorithm'].lower()
             name = remap_algorithms.get(name, name)
-            algo_ids[name] = a['algo']
+            algo_ids[name] = a['order']
         return algo_ids
 
     def get_cost(self, algorithm, amount):
@@ -39,13 +48,13 @@ class NiceHash:
         index = self._get_algorithm_index(algorithm)
         if index is None:
             return None
-        amount = self._get_in_nicehash_units(algorithm, amount)
+        amount = self.get_in_nicehash_units(algorithm, amount)
         day_cost_btc = 0.0
         for country in ['eu', 'us']:
-            resp = self._session.get('https://www.nicehash.com/siteapi/market/{}/{}/fixed?limit={}'.format(index, country, amount)).json()
+            resp = self._session.post('https://api2.nicehash.com/main/api/v2/hashpower/orders/fixedPrice/', {'limit': amount, 'market': country, 'algorithm': algorithm}).json()
             if resp['fixedPrice'] == 'Not enough hashing power available.':
                 max_fixed_price = float(resp['fixedMax']) - 0.01
-                resp = self._session.get('https://www.nicehash.com/siteapi/market/{}/{}/fixed?limit={}'.format(index, country, max_fixed_price)).json()
+                resp = self._session.post('https://api2.nicehash.com/main/api/v2/hashpower/orders/fixedPrice/', {'limit': max_fixed_price, 'market': country, 'algorithm': algorithm}).json()
                 if resp['fixedPrice'] == 'Not enough hashing power available.':
                     continue
                 day_cost_btc += float(resp['fixedPrice']) * max_fixed_price
@@ -57,32 +66,38 @@ class NiceHash:
                 return day_cost_btc
         return None
 
-    def _get_in_nicehash_units(self, algorithm, value):
-        """Use the buy info endpoint to convert the given value from h/s to the specified units in nicehash."""
-        index = self._get_algorithm_index(algorithm)
-        units = self._buy_info['result']['algorithms'][index]['speed_text']
-        if units == 'PH':
-            return value / (1000.0 ** 5)
-        elif units == 'TH':
-            return value / (1000.0 ** 4)
-        elif units == 'GH':
-            return value / (1000.0 ** 3)
-        elif units in ['MSol', 'MH']:
-            return value / (1000.0 ** 2)
-        elif units == 'KH':
-            return value / 1000.0
-        raise Exception('Unknown units: {}'.format(units))
-
     def get_units(self, algorithm):
         index = self._get_algorithm_index(algorithm)
-        units = self._buy_info['result']['algorithms'][index]['speed_text']
+        units = self._buy_info[index]['speed_text']
         return units
+
+    def get_in_nicehash_units(self, algorithm, value):
+        """Use the buy info endpoint to convert the given value from h/s to the specified units in nicehash."""
+        return value / self.get_nicehash_unit_scale(algorithm)
+
+    def get_nicehash_unit_scale(self, algorithm):
+        units = self.get_units(algorithm)
+        if units == 'PH':
+            return 1000.0 ** 5
+        elif units == 'TH':
+            return 1000.0 ** 4
+        elif units == 'GH':
+            return 1000.0 ** 3
+        elif units in ['MSol', 'MH']:
+            return 1000.0 ** 2
+        elif units in ['KH', 'kG', 'kSol']:
+            return 1000.0
+        raise Exception('Unknown units: {}'.format(units))
 
     def get_orders(self, algorithm):
         index = self._get_algorithm_index(algorithm)
         if index is None:
             return []
-        resp = requests.get('https://api.nicehash.com/api?method=orders.get&location=1&algo={}'.format(index))
+        """
+        I have no idea what does location=1 mean:
+        https://api.nicehash.com/api?method=orders.get&location=1&algo={}
+        """
+        resp = requests.get('https://api2.nicehash.com/main/api/v2/public/orders/?algorithm={}'.format(index))
         return resp.json()['result']['orders']
 
     def get_algorithm_name(self, algorithm):
@@ -97,34 +112,29 @@ class NiceHash:
     def get_algorithm_price(self, algorithm):
         """Get the hashing cost (BTC) + units.
 
-        Value is returned in BTC/UNITS/DAY.
+        Value is returned in BTC/H/DAY.
         """
         index = self._get_algorithm_index(algorithm)
         if index is None:
             return None
-        pricing = float(self._global_stats['result']['stats'][index]['price'])
+        # I have no clue where this constant comes from, but using it produces
+        # the numbers presented on Nicehash's website.
+        pricing = float(self._global_stats[index]['p']) / (10 ** 8)
         return pricing
 
     def get_cost_global(self, algorithm, hash_rate):
-        """Return the global pricing for the specified algorithm.
-
-        Speed in gh/s, and price in btc per gh/s per day.
-        """
-        index = self._get_algorithm_index(algorithm)
-        if index is None:
-            return None
-        # Convert hash rate to the units used by NiceHash.
-        hash_rate = self._get_in_nicehash_units(algorithm, hash_rate)
-        pricing = float(self._global_stats['result']['stats'][index]['price'])
-        print(algorithm, hash_rate, pricing, pricing * hash_rate)
+        """Return the daily cost of the given hashrate in btc."""
+        pricing = self.get_algorithm_price(algorithm)
+        if pricing is None:
+            return
         return pricing * hash_rate
 
     def get_capacity(self, algorithm):
         index = self._get_algorithm_index(algorithm)
         if index is None:
             return None
-        # Convert from giga
-        nicehash_speed = float(self._global_stats['result']['stats'][index]['speed']) * (1000.0 ** 3)
+        # Speed is in H/s
+        nicehash_speed = float(self._global_stats[index]['s'])
         return nicehash_speed
 
     def get_hash_percentage(self, algorithm, hash_rate):
@@ -132,7 +142,6 @@ class NiceHash:
         index = self._get_algorithm_index(algorithm)
         if index is None:
             return None
-        # Convert from giga
-        nicehash_speed = float(self._global_stats['result']['stats'][index]['speed']) * (1000.0 ** 3)
-        print(algorithm, nicehash_speed, hash_rate)
+        # Speed is in H/s
+        nicehash_speed = float(self._global_stats[index]['s'])
         return nicehash_speed / hash_rate
